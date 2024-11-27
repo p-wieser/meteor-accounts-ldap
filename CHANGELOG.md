@@ -10,6 +10,10 @@ Accounts LDAP - Changelog
 
 - Make UI part a separate package
 
+### v0.11.0-rc
+
+- Bump version requirements to be compatible with Meteor 3.0
+
 ### v0.10.1
 
 - A fix so that `thumbnailPhoto` field produces the expected base64 string
