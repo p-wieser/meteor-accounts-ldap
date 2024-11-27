@@ -146,7 +146,6 @@ LDAP._settings = function (request) {
 }
 
 var ldap = Npm.require('ldapjs');
-var Future = Npm.require('fibers/future');
 var assert = Npm.require('assert');
 
 LDAP._createClient = function () {
@@ -203,76 +202,68 @@ LDAP._createClient = function () {
   return success;
 };*/
 
-LDAP._bind = function (client, username, password, isEmail, request, settings) {
-  var success = null;
-  //Bind our LDAP client.
-  var serverDNs = (typeof (settings.serverDn) == 'string') ? [settings.serverDn] : settings.serverDn;
-  for (var k in serverDNs) {
-    var FQDN = LDAP._serverDnToFQDN(serverDNs[k]);
-    var userDn = LDAP.bindValue.call(request, username, isEmail, FQDN);
-
-    LDAP.log ('Trying to bind ' + userDn + '...');
-
-    var bindFuture = new Future();
+LDAP._bindTry = function (client, userDn, password) {
+  return new Promise(( resolve, reject ) => {
     client.bind(userDn, password, function (err) {
       LDAP.log ('Callback from binding LDAP:');
       if (err) {
         LDAP.error('LDAP bind failed with error:');
         LDAP.error(JSON.stringify(err));
         // LDAP.error(JSON.stringify({dn: err.dn, code: err.code, name: err.name, message: err.message}));
-        bindFuture.return(false);
+        resolve( false );
       } else {
-        bindFuture.return(true);
+        resolve( true );
       }
     });
-    success = bindFuture.wait();
-    if (success) {
-      break;
-    }
-  }
-
-  if (!success || password === '') {
-    if (_.isFunction(LDAP.alwaysCreateAccountIf) && LDAP.alwaysCreateAccountIf(request) && username && password) {
-      return true; // true that we should create a user
-    }
-    else {
-      throw new Meteor.Error(403, "Invalid credentials");
-    }
-  }
-  return;
+  });
 };
 
-LDAP._search = function (client, searchUsername, isEmail, request, settings) {
-  // Search our previously bound connection. If the LDAP client isn't bound, this should throw an error.
-  var opts = {
-    scope: 'sub',
-    timeLimit: 2,
-    attributes: LDAP.attributes
-  };
-  var serverDNs = (typeof(settings.serverDn) == 'string') ? [settings.serverDn] : settings.serverDn;
-  var result = false;
-  for (var k in serverDNs) {
-    var searchFuture = new Future();
-    var serverDn = serverDNs[k];
-    opts.filter = LDAP.filter.call(request, isEmail, searchUsername, LDAP._serverDnToFQDN(serverDn), settings);
-    LDAP.log ('Searching ' + serverDn);
-    client.search(serverDn, opts, function (err, res) {
-      userObj = {};
+LDAP._bindServers = async function (client, username, password, isEmail, request, serverDNs) {
+  for await (const serverDn of serverDNs) {
+    var FQDN = LDAP._serverDnToFQDN(serverDn);
+    var userDn = LDAP.bindValue.call(request, username, isEmail, FQDN);
+    let success;
+    LDAP.log ('Trying to bind ' + userDn + '...');
+    try {
+      success = await LDAP._bindTry( client, userDn, password );
+      if (success) {
+        LDAP.log(`Successfully bound to ${serverDn}`);
+        return success; // Exit the loop if successful
+      } else {
+        LDAP.warn(`Failed to bind to ${serverDn}`);
+      }
+    } catch (error) {
+      LDAP.error(`Error binding to ${serverDn}:`, error.message);
+    }
+  }
+  return success;
+};
+
+// must return:
+// true: if the bind has failed
+// false: if the bind is successful
+LDAP._bind = async function (client, username, password, isEmail, request, settings) {
+  var serverDNs = (typeof (settings.serverDn) == 'string') ? [settings.serverDn] : settings.serverDn;
+  const success = await LDAP._bindServers( client, username, password, isEmail, request, serverDNs );
+  return !success;
+};
+
+LDAP._searchDirectory = async function (client, searchUsername, server, isEmail, request, settings, opts) {
+  return new Promise(( resolve, reject ) => {
+    client.search(server, opts, function (err, res) {
+      let userObj = {};
       if (err) {
-        if (!searchFuture.isResolved()) {
-          searchFuture.return(500);
-        }
+        reject( 500 );
       }
       else {
         res.on('searchEntry', function (entry) {
-          if (!searchFuture.isResolved()) {
             var person = entry.object;
             if (entry.raw && entry.raw.thumbnailPhoto) {
               person.thumbnailPhoto = entry.raw.thumbnailPhoto.toString('base64');
             }
             var usernameOrEmail = searchUsername.toLowerCase();
             var username = (isEmail) ? usernameOrEmail.split('@')[0] : usernameOrEmail; // Used to have: person.cn || usernameOrEmail.split('@')[0] -- guessing the username based on the email is pretty poor
-            var email = (isEmail) ? usernameOrEmail.toLowerCase() : username.toLowerCase() + '@' + LDAP._serverDnToFQDN(serverDn); // (isEmail) ? usernameOrEmail : person.mail ||
+            var email = (isEmail) ? usernameOrEmail.toLowerCase() : username.toLowerCase() + '@' + LDAP._serverDnToFQDN(server); // (isEmail) ? usernameOrEmail : person.mail ||
             userObj = {
               username: username,
               email: (isEmail) ? usernameOrEmail : person.mail || email, // best we can do with the info we have
@@ -281,37 +272,49 @@ LDAP._search = function (client, searchUsername, isEmail, request, settings) {
             };
             userObj.username = LDAP.appUsername.call(request, username, isEmail, userObj);
             // _.extend({username: username, email : [{address: email, verified: LDAP.autoVerifyEmail}]}, _.pick(entry.object, _.without(settings.whiteListedFields, 'mail')));
-            searchFuture.return({userObj: userObj, person: person, ldapIdentifierUsername: username});
-          }
+            resolve({userObj: userObj, person: person, ldapIdentifierUsername: username});
+          //}
         });
         res.on('searchReference', function (referral) {
           LDAP.log('referral: ' + referral.uris.join());
-          if (!searchFuture.isResolved()) {
-            searchFuture.return(false);
-          }
+          reject( false );
         });
         res.on('error', function (err) {
           LDAP.error('error: ' + err.message);
-          if (!searchFuture.isResolved()) {
-            searchFuture.return(false);
-          }
+          reject( false );
         });
         res.on('end', function (result) {
           if (_.isEmpty(userObj)) {
             //Our LDAP server gives no indication that we found no entries for our search, so we have to make sure our object isn't empty.
             LDAP.log("No result found.");
-            if (!searchFuture.isResolved()) {
-              searchFuture.return(false);
-            }
+            reject( false );
           }
           LDAP.log('status: ' + result.status);
         });
       }
     });
-    result = searchFuture.wait();
-    if (result) {
-      return result;
+  });
+};
+
+LDAP._searchServers = async function (client, searchUsername, isEmail, request, settings, servers) {
+  // Search our previously bound connection. If the LDAP client isn't bound, this should throw an error.
+  var opts = {
+    scope: 'sub',
+    timeLimit: 2,
+    attributes: LDAP.attributes
+  };
+  var result = false;
+  for await (const serverDn of servers) {
+    opts.filter = LDAP.filter.call(request, isEmail, searchUsername, LDAP._serverDnToFQDN(serverDn), settings);
+    LDAP.log ('Searching ' + serverDn);
+    try {
+      result = await LDAP._searchDirectory( client, searchUsername, serverDn, isEmail, request, settings, opts );
+    } catch( e ){
+      LDAP.error( 'rejected with', e );
     }
+  }
+  if( result && !_.isEmpty( result )){
+    return result;
   }
   //If we're in debugMode, return an object with just the username. If not, return null to indicate no result was found.
   if (settings.debugMode === true) {
@@ -322,8 +325,15 @@ LDAP._search = function (client, searchUsername, isEmail, request, settings) {
   }
 };
 
+// must return an object with 'userObj' and 'person' keys, or anything else (e.g. a falsy value)
+LDAP._search = async function (client, searchUsername, isEmail, request, settings) {
+  var serverDNs = (typeof(settings.serverDn) == 'string') ? [settings.serverDn] : settings.serverDn;
+  var result = await LDAP._searchServers( client, searchUsername, isEmail, request, settings, serverDNs );
+  return result;
+};
+
 // This is the Meteor specific login handler
-Accounts.registerLoginHandler("ldap", function (request) {
+Accounts.registerLoginHandler("ldap", async function (request) {
   if (!request.ldap) {
     return;
   }
@@ -384,11 +394,11 @@ Accounts.registerLoginHandler("ldap", function (request) {
       }
     }
     var userLookupQuery = LDAP.userLookupQuery.call(request, fieldName, fieldValue, isEmail, isMultitenantIdentifier);
-    user = Meteor.users.findOne(userLookupQuery);
+    user = await Meteor.users.findOneAsync(userLookupQuery);
 	  if (!user && isMultitenantIdentifier) {
       // try again with backup query
       var userLookupQuery = LDAP.userLookupQuery.call(request, backupFieldName, backupFieldValue, isEmail, false);
-      user = Meteor.users.findOne(userLookupQuery);
+      user = await Meteor.users.findOneAsync(userLookupQuery);
     }
     if (user && user.services && user.services.password && user.services.password.bcrypt && request.pwd) {
       var res = Accounts._checkPassword(user, request.pwd);
@@ -420,9 +430,11 @@ Accounts.registerLoginHandler("ldap", function (request) {
         return;
       }
     }*/
-    var bindFailedButCreateUserAnyway = LDAP._bind(client, request.username, request.password, isEmail, request, settings);
+    var bindFailedButCreateUserAnyway = await LDAP._bind(client, request.username, request.password, isEmail, request, settings);
+    console.debug( 'bindFailedButCreateUserAnyway', bindFailedButCreateUserAnyway );
     if (!bindFailedButCreateUserAnyway) {
-      var returnData = LDAP._search(client, request.username, isEmail, request, settings);
+      var returnData = await LDAP._search(client, request.username, isEmail, request, settings);
+      console.debug( 'returnData', returnData );
       if (!returnData || !(returnData.userObj && returnData.person)) {
         LDAP.log('No record was returned via LDAP');
         return; // Login handlers need to return undefined if the login fails
@@ -482,7 +494,7 @@ Accounts.registerLoginHandler("ldap", function (request) {
     // The uniqueIdentifier must be guaranteed to be globally unique
     var uniqueIdentifier = LDAP._stringifyUniqueIdentifier(person[settings.uniqueIdentifier]);
     var query = {ldapIdentifier: uniqueIdentifier};
-    var user = Meteor.users.findOne(query);
+    var user = await Meteor.users.findOneAsync(query);
     if (user) {
       userId = user._id;
       LDAP.log('User found in app database by uniqueIdentifier: ' + JSON.stringify(user));
@@ -507,7 +519,7 @@ Accounts.registerLoginHandler("ldap", function (request) {
       // This is why we have the LDAP.modifyCondition function available to overwrite
       condition = LDAP.modifyCondition.call(request, condition, userObj);
     }
-    var user = Meteor.users.findOne(condition);
+    var user = await Meteor.users.findOneAsync(condition);
     if (user) {
       if (bindFailedButCreateUserAnyway) {
         var res = Accounts._checkPassword(user, request.pwd);
@@ -542,10 +554,10 @@ Accounts.registerLoginHandler("ldap", function (request) {
           var newLdapIdentifier = (bindFailedButCreateUserAnyway) ? request.data[LDAP.multitenantIdentifier] + '-' + LDAP.appUsername.call(request, whatUserTyped, isEmail, userObj) : userObj.ldapIdentifier[0];
           extraFields.ldapIdentifier = [newLdapIdentifier];
         }
-        userId = Accounts.createUser(tempUserObj);
-        user = Meteor.users.findOne({_id: userId});
+        userId = await Accounts.createUserAsync(tempUserObj);
+        user = await Meteor.users.findOneAsync({_id: userId});
         if (user && !_.isEmpty(extraFields)) {
-          Meteor.users.update({_id: userId}, {$set: extraFields});
+          await Meteor.users.updateAsync({_id: userId}, {$set: extraFields});
         }
       }
       catch (err) {
@@ -562,7 +574,7 @@ Accounts.registerLoginHandler("ldap", function (request) {
             var newLdapIdentifier = (bindFailedButCreateUserAnyway) ? request.data[LDAP.multitenantIdentifier] + '-' + LDAP.appUsername.call(request, whatUserTyped, isEmail, userObj) : userObj.ldapIdentifier[0];
             var condition = {};
             condition.emails = {$elemMatch: {address: userObj.email}};
-            var user = Meteor.users.findOne(condition);
+            var user = await Meteor.users.findOneAsync(condition);
             if (bindFailedButCreateUserAnyway) {
               var res = Accounts._checkPassword(user, request.pwd);
               if (res.error) {
@@ -574,7 +586,7 @@ Accounts.registerLoginHandler("ldap", function (request) {
               LDAP.log('Adding a new ldapIdentifier: ' + newLdapIdentifier);
               var userId = user._id;
               // Add the ldapIdentifier
-              Meteor.users.update({_id: userId}, {$addToSet: {ldapIdentifier: newLdapIdentifier}});
+              await Meteor.users.updateAsync({_id: userId}, {$addToSet: {ldapIdentifier: newLdapIdentifier}});
               LDAP.log('Fields added using LDAP.addFields will be ignored.');
               skip = true;
               LDAP.log('Use LDAP.onAddMultitenantIdentifier to add or update fields as needed in this situation.');
@@ -601,7 +613,7 @@ Accounts.registerLoginHandler("ldap", function (request) {
           delete userObj.profile;
           // Because Accounts.createUser only accepts username, email, password and profile fields
           if (!_.isEmpty(userObj)) {
-            Meteor.users.update({_id: userId}, {$set: userObj}, function (err, res) {
+            await Meteor.users.updateAsync({_id: userId}, {$set: userObj}, function (err, res) {
               if (err) {
                 LDAP.error(err);
               }
@@ -630,7 +642,7 @@ Accounts.registerLoginHandler("ldap", function (request) {
       pushToUser.ldapIdentifier = uniqueIdentifier;
     }
   }
-  Meteor.users.update(userId, {$push: pushToUser});
+  await Meteor.users.updateAsync(userId, {$push: pushToUser});
   return {
     userId: userId,
     token: stampedToken.token,
