@@ -28,6 +28,13 @@ LDAP.bindValue = function (usernameOrEmail, isEmailAddress, FQDN) {
   return ((isEmailAddress) ? usernameOrEmail.split('@')[0] : usernameOrEmail) + '@' + FQDN;
 }
 
+// Default (and historical) behaviour is to create the user document into the local accounts collection as soon as it has been authenticated with LDAP
+// Overwrite this function if you want take this decision yourself, for example based on the data returned from LDAP
+
+LDAP.createUserIfNotExists = async function (usernameOrEmail, ldapObject) {
+  return true;
+}
+
 // This filter, used with default settings for LDAP.searchField assumes that the part of the email address before the @ perfectly matches the cn value for each user
 // Overwrite this if you need a custom filter for your particular LDAP configuration
 // For example if everyone has the 'mail' field set, but the bit before the @ in the email address doesn't exactly match users' cn values, you could do:
@@ -437,7 +444,6 @@ Accounts.registerLoginHandler("ldap", async function (request) {
       }
     }*/
     var bindFailedButCreateUserAnyway = await LDAP._bind(client, request.username, request.password, isEmail, request, settings);
-    console.debug( 'bindFailedButCreateUserAnyway', bindFailedButCreateUserAnyway );
     if (!bindFailedButCreateUserAnyway) {
       var returnData = await LDAP._search(client, request.username, isEmail, request, settings);
       console.debug( 'returnData', returnData );
@@ -538,7 +544,7 @@ Accounts.registerLoginHandler("ldap", async function (request) {
       userId = user._id;
       // Meteor.users.update(userId, {$set: userObj});
     }
-    else {
+    else if (await LDAP.createUserIfNotExists(request.username, userObj)) {
       // Need to remove password as this gets logged
       var clonedUserObj = _.clone(userObj);
       clonedUserObj.password = 'xxxxxx';
@@ -627,6 +633,8 @@ Accounts.registerLoginHandler("ldap", async function (request) {
           }
         }
       }
+    } else {
+      LDAP.log('user not created as refused by createUserIfNotExists()');
     }
   }
   if (settings.autopublishFields) {
