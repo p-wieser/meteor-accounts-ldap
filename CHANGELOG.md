@@ -14,6 +14,7 @@ Accounts LDAP - Changelog
 
 - Define new LDAP.searchBase() to let the caller override the base of the LDAP search
 - Define new LDAP.createUserIfNotExists() to let the caller decide whether to create or not the new user account
+- Define new LDAP.createUser() when the caller wants more control about the account creation
 
 ### v0.11.0-rc
 
