@@ -10,6 +10,10 @@ Accounts LDAP - Changelog
 
 - Make UI part a separate package
 
+### v0.12.0-rc
+
+- Define new LDAP.searchBase() to let the caller override the base of the LDAP search
+
 ### v0.11.0-rc
 
 - Bump version requirements to be compatible with Meteor 3.0

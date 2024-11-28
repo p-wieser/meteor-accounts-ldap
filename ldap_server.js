@@ -64,6 +64,11 @@ LDAP.searchValue = function (isEmailAddress, usernameOrEmail, FQDN, settings) {
   return searchValue;
 }
 
+// Overwrite this function to modify the base of the search
+LDAP.searchBase = function(searchUsername, server, request, settings) {
+  return server;
+}
+
 // Flag to tell the loginHandler to have a poke at the app database first
 // (will only work if accounts-password package is present)
 LDAP.tryDBFirst = false;
@@ -250,7 +255,8 @@ LDAP._bind = async function (client, username, password, isEmail, request, setti
 
 LDAP._searchDirectory = async function (client, searchUsername, server, isEmail, request, settings, opts) {
   return new Promise(( resolve, reject ) => {
-    client.search(server, opts, function (err, res) {
+    const base = LDAP.searchBase( searchUsername, server, request, settings );
+    client.search(base, opts, function (err, res) {
       let userObj = {};
       if (err) {
         reject( 500 );
