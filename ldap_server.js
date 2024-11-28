@@ -219,10 +219,10 @@ LDAP._bindTry = function (client, userDn, password) {
 };
 
 LDAP._bindServers = async function (client, username, password, isEmail, request, serverDNs) {
+  let success;
   for await (const serverDn of serverDNs) {
     var FQDN = LDAP._serverDnToFQDN(serverDn);
     var userDn = LDAP.bindValue.call(request, username, isEmail, FQDN);
-    let success;
     LDAP.log ('Trying to bind ' + userDn + '...');
     try {
       success = await LDAP._bindTry( client, userDn, password );
